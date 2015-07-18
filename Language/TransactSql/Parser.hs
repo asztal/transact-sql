@@ -1,67 +1,175 @@
-module Language.TransactSql.Parser
-       ( select
-       , run
-       ) where
+{-# LANGUAGE LambdaCase #-}
 
-import Control.Applicative ((<$>), (<|>), (<*), (<*>), (*>), (<$), many, pure)
-import Control.Monad (when) 
+module Language.TransactSql.Parser
+       ( check
+       , select
+       , statement, statements
+       , batch, batches
+       ) where
 
 import Text.Parsec hiding ((<|>), many)
 import Text.Parsec.Combinator
 import Text.Parsec.Expr
 import Text.Parsec.Perm (permute, (<$?>), (<|?>))
-import qualified Text.Parsec.Char as C
+import Text.Parsec.Char (alphaNum)
+import Text.Parsec.Pos
 import qualified Text.Parsec.Token as T
 
 import Language.TransactSql.Types
 import Language.TransactSql.AST
 import Language.TransactSql.Loc
 
-import qualified System.Directory as D
-import Control.Monad (forM)
-import System.FilePath ((</>))
-import Data.Char (toLower, isSpace)
-import Control.Monad (mzero)
+import Control.Applicative ((<$>), (<|>), (<*), (<*>), (*>), (<$), many, pure)
+import Control.Monad (forM, forM_, liftM2, mzero, when)
+import Data.Char (toLower, toUpper, isSpace, digitToInt)
 import Data.Function (on)
+import Data.List (foldl', isSuffixOf, sort)
+import Data.Maybe (fromMaybe, catMaybes)
 import Data.List.Split (splitWhen)
+import System.Directory (getDirectoryContents)
+import System.FilePath ((</>))
 
-type P a = Parsec String () a
+-- Comments probably need to be categorised:
+-- 1. Whole line comments (whether block or line comments)
+--    These probably reference the construct after the comment.
+-- 2. End-of-line comments.
+--    These probably reference the largest construct which is entirely
+--    contained within the line.
+-- 3. Inline comments.
+--    It's hard to tell whether these reference the preceding or next construct,
+--    or what level of a nested expression it might refer to.
+--    E.g. declare @x int = @y + @z * 9.81 /* accel due to gravity */
+--    Does the comment refer to 9.81? @z * 9.81? @y + @z * 9.81?
+--    In this case it's probably best to attach it to the closest (and
+--    smallest) possible construct.
+data ParserState
+  = ParserState { stBatchSeparator :: Maybe String
+                , stUnclaimedComments :: [(SrcSpan, String)]
+                }
+  deriving (Eq, Ord, Show)
 
-sqlDef :: T.LanguageDef ()
-sqlDef = T.LanguageDef
-         { T.commentStart = "/*"
-         , T.commentEnd = "*/"
-         , T.commentLine = "--"
-         , T.nestedComments = False
-         , T.identStart = letter <|> char '_'
-         , T.identLetter = alphaNum <|> char '_'
-         , T.opStart = C.oneOf "-=+*&^%/<>~|."
-         , T.opLetter = C.oneOf "-=+*&^%/<>~|."
-         , T.reservedNames = ["begin", "by", "case", "cast", "declare", "end", "from", "group", "having", "into", "is", "null", "over", "partition", "role", "schema", "table", "view"]
-         , T.reservedOpNames = []
-         , T.caseSensitive = False
-         }
+initialParserState = ParserState (Just "go") []
+                   
+type P a = Parsec String ParserState a
 
-lexer = T.makeTokenParser sqlDef
-identifier = T.identifier lexer
-symbol = T.symbol lexer
-reserved = T.reserved lexer
-operator = T.operator lexer
-reservedOp = T.reservedOp lexer
-lexeme = T.lexeme lexer
-whiteSpace = T.whiteSpace lexer
-parens = T.parens lexer
-squares = T.brackets lexer
+reservedWords = ["add", "all", "alter", "and", "any", "as", "asc", "authorization", "backup", "begin",
+                 "between", "break", "browse", "bulk", "by", "cascade", "case", "check", "checkpoint",
+                 "close", "clustered", "coalesce", "collate", "column", "commit", "compute", "constraint",
+                 "contains", "containstable", "continue", "convert", "create", "cross", "current",
+                 "current_date", "current_time", "current_timestamp", "current_user", "cursor", "database",
+                 "dbcc", "deallocate", "declare", "default", "delete", "deny", "desc", "disk", "distinct",
+                 "distributed", "double", "drop", "dump", "else", "end", "errlvl", "escape", "except",
+                 "exec", "execute", "exists", "exit", "external", "fetch", "file", "fillfactor", "for",
+                 "foreign", "freetext", "freetexttable", "from", "full", "function", "goto", "grant",
+                 "group", "having", "holdlock", "identity", "identity_insert", "identitycol", "if", "in",
+                 "index", "inner", "insert", "intersect", "into", "is", "join", "key", "kill", "left",
+                 "like", "lineno", "load", "merge", "national", "nocheck", "nonclustered", "not", "null",
+                 "nullif", "of", "off", "offsets", "on", "open", "opendatasource", "openquery", "openrowset",
+                 "openxml", "option", "or", "order", "outer", "over", "percent", "pivot", "plan", "precision",
+                 "primary", "print", "proc", "procedure", "public", "raiserror", "read", "readtext", "reconfigure",
+                 "references", "replication", "restore", "restrict", "return", "revert", "revoke", "right",
+                 "rollback", "rowcount", "rowguidcol", "rule", "save", "schema", "securityaudit", "select",
+                 "semantickeyphrasetable", "semanticsimilaritydetailstable", "semanticsimilaritytable",
+                 "session_user", "set", "setuser", "shutdown", "some", "statistics", "system_user", "table",
+                 "tablesample", "textsize", "then", "to", "top", "tran", "transaction", "trigger", "truncate",
+                 "try_convert", "tsequal", "union", "unique", "unpivot", "update", "updatetext", "use", "user",
+                 "values", "varying", "view", "waitfor", "when", "where", "while", "with", "within group", "writetext"]
+
+operatorChars = "-=+*&^%/<>~|."
+
+comment = try (storeComment lineComment) <|> try (storeComment blockComment) <?> ""
+  where lineComment = string "--" *> many (noneOf "\n") <?> ""
+        blockComment = string "/*" *> inComment <* string "*/" <?> ""
+        inComment = concat <$> many commentText <?> "end of comment"
+        commentText = (:[]) <$> noneOf "*/"
+                      <|> try (string "/*" *> nestedComment)
+                      <|> try (string "*" <* notFollowedBy (char '/'))
+                      <|> string "/"
+                      <?> "end of comment"
+        nestedComment = concat <$> sequence [pure "/*", inComment, string "*/"]
+                      
+        storeComment :: P String -> P ()
+        storeComment p = do pos <- getPosition
+                            text <- p
+                            pos' <- getPosition
+                            modifyState $ \(ParserState bs cs) -> ParserState bs ((mkSpan pos pos', text):cs)
+
+
+-- Matches semantic white space, including comments and newlines (but not where there's a batch separator!)
+whiteSpace = skipMany space <?> ""
+  where space = lineSpace <|> try newLine <|> comment <?> ""
+        newLine = char '\n' *> notFollowedBy (batchSeparator *> (fromMaybe "go" . stBatchSeparator <$> getState)) <?> "" -- notFollowedBy calls "show" on whatever's returned
+
+inlineWhiteSpace = skipMany space <?> ""
+  where space = lineSpace <|> comment <?> ""
+
+-- Batch separators can be followed by a number, which specifies how many
+-- times the batch is to be run. Why, I have no idea...
+batchSeparator :: P (Maybe (Located Integer))
+batchSeparator =  startOfLine >> fmap stBatchSeparator getState >>= \case
+  Just bs -> inlineWhiteSpace
+             *> string bs
+             *> inlineWhiteSpace
+             *> optionMaybe (loc nat <* inlineWhiteSpace)
+             <* (char '\n' *> return () <|> eof)
+             <?> show bs
+  Nothing -> fail "Cannot use batch separators inside a batch"
+  where startOfLine = do col <- sourceColumn <$> getPosition
+                         when (col /= 1) $ fail "Batch separator can't appear mid-line"
+
+-- Parses a quoted string, where the only character that needs to be escaped is the
+-- close character, which is escaped by writing it twice.
+quoted :: Char -> Char -> P String
+quoted open close =
+  char open *> many quotedChar <* char close
+  where quotedChar = satisfy (/= close)
+                     <|> try (char close >> char close) 
+
+-- Matches actual white space char within a particular line
+lineSpace :: P ()
+lineSpace = satisfy (\c -> isSpace c && c /= '\n') *> return ()
+
+nat, natural :: P Integer
+natural = lexeme nat
+nat = foldl' (\x d -> 10*x + toInteger (digitToInt d)) 0 <$> many1 digit 
+
+integer = lexeme sign <*> natural
+  where sign = char '-' *> pure negate
+               <|> char '+' *> pure id
+               <|> pure id
+
+lexeme p = p <* whiteSpace
+
+reserved name = lexeme $ try $ ciString name <* (notFollowedBy (alphaNum <|> char '_') <?> "end of " ++ show name)
+ciString name = walk name *> pure name
+  where walk [] = return ()
+        walk (c:cs) = (char (toLower c) <|> char (toUpper c) <?> show name) *> walk cs
+        
+identifier = lexeme $ try $ do name <- ident
+                               if isReservedName name
+                                 then unexpected ("reserved word " ++ show name)
+                                 else return name
+  where ident = (:) <$> (letter <|> char '_') <*> many (alphaNum <|> char '_')
+                <?> "identifier"
+                
+isReservedName name = map toLower name `elem` reservedWords -- TODO: performance?
+
+symbol name = lexeme (string name)
+operator = try $ lexeme $ many1 (oneOf operatorChars)
+reservedOp name = lexeme $ string name <* notFollowedBy (oneOf operatorChars <?> "end of " ++ show name)
+
+parens p = between (symbol "(") (symbol ")") p
+squares p = between (symbol "[") (symbol "]") p
 
 boundedInt :: Integer -> Integer -> P Int
 boundedInt low high = do
-  n <- T.integer lexer
+  n <- natural
   when (n > high || n < low) $
     fail ("expected number between " ++ show low ++ " and " ++ show high)
   return (fromIntegral n)
 
-var = char '@' *> identifier
-serverVar = char '@' *> char '@' *> identifier
+var = lexeme (char '@' *> identifier)
+serverVar = lexeme (char '@' *> char '@' *> identifier)
 
 comma = symbol ","
 period = symbol "."
@@ -77,16 +185,20 @@ loc p = do
   return $ L (mkSpan start end) value
 
 keyword :: String -> P Keyword
-keyword word = Keyword <$> loc (reserved word >> pure word)
+keyword word = Keyword <$> loc (reserved word)
 
 keywords :: [String] -> P Keyword
 keywords words = Keyword <$> loc (mapM_ reserved words >> pure (unwords words))
                  <?> show (unwords words)
 
+stringLit = lexeme $ (quoted '\'' '\'')
+
 literal :: P Literal
-literal = (IntL <$> loc (T.integer lexer) <?> "integer literal")
-          <|> (StrL <$> loc (quoted '\'' '\'') <?> "string literal")
-          <|> (NullL <$> keyword "null" <?> "null")
+literal = (IntL <$> loc integer)
+          <|> (StrL <$> loc stringLit)
+          <|> try (char 'N' *> (NStrL <$> loc stringLit))
+          <|> (NullL <$> keyword "null")
+          <?> "value"
 
 typeName :: P SqlType
 typeName = (identifier >>= rest) <?> "type name"
@@ -97,26 +209,35 @@ typeName = (identifier >>= rest) <?> "type name"
         rest "nvarchar" = NVarChar <$> len
         rest "binary" = Binary <$> len
         rest "varbinary" = VarBinary <$> len
+        rest "float" = Float <$> spec 1 64 53
+        rest "real" = Float <$> pure 24
+        rest "smalldatetime" = pure SmallDateTime
+        rest "date" = pure Date
         rest name = fail $ "unknown type name: " ++ name
 
+        spec minVal maxVal defVal = option defVal (parens $ boundedInt 0 maxVal)
         len = parens (reserved "max" *> pure (-1)
                       <|> boundedInt 1 0x7FFFFFFF)
-
+              
 term :: P Expr
 term = unLoc <$> parens expr
-       <|> (varOrServerVar <?> "variable name")
+       <|> varName 
        <|> ELit <$> loc literal
        <|> reserved "cast" *> parens (ECast <$> expr <*> (reserved "as" *> loc typeName))
        <|> caseExpr
        <|> try (EColRef . Just <$> (objectName <* period) <*> ident)
+       <|> try funCall
        <|> EColRef Nothing <$> ident
   where caseExpr = reserved "case" *> (condCase <|> exprCase) <* reserved "end"
-        condCase = ECondCase <$> many1 (branch (loc cond)) <*> final
-        exprCase = EExprCase <$> expr <*> many1 (branch expr) <*> final
+        condCase = ESearchCase <$> many1 (branch (loc cond)) <*> final
+        exprCase = ESimpleCase <$> expr <*> many1 (branch expr) <*> final
         branch on = (,) <$> (reserved "when" *> on) <*> (reserved "then" *> expr)
         final = optionMaybe (reserved "else" *> expr)
-        varOrServerVar = char '@' *> (EVar <$> ident
-                                      <|> EServerVar <$> (char '@' *> ident))
+        varName = try (EServerVar <$> Ident <$> loc serverVar)
+                  <|> EVar <$> Ident <$> loc var
+                  <?> "variable name"
+        funCall = EFunCall <$> try (specialFun <|> objectName) <*> parens (expr `sepBy` comma)
+        specialFun = choice $ map (\w -> ObjectName Nothing Nothing Nothing <$> loc (reserved w)) ["left", "right"]
 
 expr :: P (Located Expr)
 expr = loc (unLoc <$> buildExpressionParser ops (loc term)) <?> "expression"
@@ -153,24 +274,21 @@ cond = CPred <$> predicate
 
 comparison :: P Comparison
 comparison = reservedOp "=" *> pure CEq
+         <|> try (reservedOp "<>" *> pure CNeq)
+         <|> try (reservedOp ">=" *> pure CGte)
+         <|> try (reservedOp "<=" *> pure CLte)
          <|> reservedOp ">" *> pure CGt
          <|> reservedOp "<" *> pure CLt
-         <|> reservedOp ">=" *> pure CGte
-         <|> reservedOp "<=" *> pure CLte
-         <|> reservedOp "<>" *> pure CNeq
+         <?> "comparison operator"
 
 predicate :: P Pred
-predicate = flip PCompare <$> expr <*> loc comparison <*> expr
-            <|> try nullNotNull
-  where nullNotNull = expr >>= \e ->
-          try (PNull <$> keywords ["is", "null"] <*> pure e
-               <|> PNotNull <$> keywords ["is", "not", "null"] <*> pure e)
-
-quoted :: Char -> Char -> P String
-quoted open close =
-  char open *> many quotedChar <* char close
-  where quotedChar = satisfy (/= close)
-                     <|> try (char close >> char close) 
+predicate = PExists <$> keyword "exists" <*> parens (loc select)
+            <|> (expr >>= expressionPred)
+  where expressionPred e =
+          PCompare <$> (loc comparison) <*> pure e <*> expr
+          <|> PNull <$> keywords ["is", "null"] <*> pure e
+          <|> PNotNull <$> keywords ["is", "not", "null"] <*> pure e
+          <|> PBetween <$> keyword "between" <*> pure e <*> expr <*> expr
 
 -- xyz, [xyz], or "xyz"
 rawIdent :: P String
@@ -182,9 +300,18 @@ ident = Ident <$> loc rawIdent
 
 -- TODO: Dotted notation (figure out least ugly way)
 objectName :: P ObjectName
-objectName = ObjectName Nothing Nothing Nothing
-             <$> loc rawIdent
+objectName = try (ObjectName <$> part
+                             <*> (period *> opt)
+                             <*> (period *> opt)
+                             <*> (period *> loc rawIdent)) -- server.database?.schema?.obj
+             <|> try (ObjectName Nothing <$> part
+                                         <*> (period *> opt)
+                                         <*> (period *> loc rawIdent)) -- database.schema?.obj
+             <|> try (ObjectName Nothing Nothing <$> part <*> (period *> loc rawIdent))
+             <|> ObjectName Nothing Nothing Nothing <$> loc rawIdent
              <?> "object name"
+  where part = Just <$> loc rawIdent
+        opt = optionMaybe (loc rawIdent)
 
 tableRef :: P TableRef
 tableRef = uncurry TableRef <$> withAlias objectName
@@ -213,6 +340,7 @@ select = do
 
   where
     col = try (SelectWildcard <$> optionMaybe (ident <* period) <* star)
+          <|> try (SelectIntoVar <$> (Ident <$> loc var) <*> (symbol "=" *> expr))
           <|> uncurry SelectExpr <$> withAlias expr
           <?> "column specification"
     
@@ -232,7 +360,7 @@ declare = Declare <$> keyword "declare" <*> (loc eqn `sepBy1` comma)
   where eqn :: P Decl
         eqn = Decl
               <$> (Ident <$> loc var)
-              <*> loc typeName
+              <*> (optional (reserved "as") *> loc typeName)
               <*> optionMaybe (equals *> expr)
               <?> "declaration"
 
@@ -240,7 +368,7 @@ dropStatement :: P Statement
 dropStatement = keyword "drop" *> (keyword "procedure" *> (DropProcedure <$> loc objectName))
 
 createStatement :: P Statement
-createStatement = keyword "create" *> (keyword "procedure" *> createProc <* eof)
+createStatement = keyword "create" *> (keyword "procedure" *> createProc)
   where createProc = CreateProcedure
                      <$> loc objectName
                      <*> (parens args <|> args)
@@ -259,7 +387,7 @@ createStatement = keyword "create" *> (keyword "procedure" *> createProc <* eof)
         args = arg `sepBy` comma
         arg = Argument
               <$> (Ident <$> loc var)
-              <*> loc typeName
+              <*> (optional (reserved "as") *> loc typeName)
               <*> loc argType
               <*> optionMaybe (equals *> expr)
 
@@ -269,7 +397,9 @@ createStatement = keyword "create" *> (keyword "procedure" *> createProc <* eof)
 flowStatement :: P Statement
 flowStatement = block <|> if' <|> while <|> break <|> continue <|> goto <|> return
   where block = reserved "begin" *> (Block <$> statements) <* reserved "end"
-        if' = reserved "if" *> (If <$> loc cond <*> loc statement <*> loc statement)
+        if' = reserved "if" *> (If <$> loc cond
+                                   <*> loc statement
+                                   <*> optionMaybe (reserved "else" *> loc statement))
         while = reserved "while" *> (While <$> loc cond <*> loc statement)
         break = reserved "break" *> pure Break
         continue = reserved "continue" *> pure Continue
@@ -279,12 +409,32 @@ flowStatement = block <|> if' <|> while <|> break <|> continue <|> goto <|> retu
 dmlStatement :: P Statement
 dmlStatement = declare
             <|> (Select <$> loc select)
+            <|> reserved "set" *> (SetVar <$> (Ident <$> loc var) <*> (equals *> expr))
 
 ddlStatement :: P Statement
 ddlStatement = dropStatement <|> createStatement
 
+execStatement :: P Statement
+execStatement = do (keyword "exec" <|> keyword "execute") *> (execString <|> execModule)
+  where execString = ExecString <$> parens (loc (ELit <$> loc (StrL <$> loc stringLit))) -- TODO: concatenation here
+        execModule = do
+          target <- optionMaybe $ try $ (Ident <$> loc var) <* equals
+          mod <- Left <$> objectName
+                 <|> Right . Ident <$> loc var
+          posArgs <- loc posArg `sepBy` comma
+          namedArgs <- if null posArgs -- Don't need a comma if there were no positional arguments
+                         then namedArg `sepBy` comma
+                         else option [] (comma *> (namedArg `sepBy` comma))
+          return $ Exec target mod posArgs namedArgs
+
+        posArg = ELit <$> loc literal
+                 <|> EVar . Ident <$> loc var
+                 <|> reserved "default" *> fail "Not implemented" -- TODO: implement (add to AST?)
+
+        namedArg = (,) <$> (Ident <$> (loc var <* equals)) <*> loc posArg
+
 statement :: P Statement
-statement = flowStatement <|> ddlStatement <|> dmlStatement <?> "statement"
+statement = execStatement <|> flowStatement <|> ddlStatement <|> dmlStatement <?> "statement"
 
 statements :: P [Located Statement]
 statements = loc statement `sepBy` optional semicolon
@@ -307,44 +457,38 @@ withPosition newPos p = do
   x <- p
   setPosition oldPos
   return x
-  
--- Parses a file in batch mode. If a line is "go", it will 
-file = mapM parseChunk =<< splitWhen (isGo . map toLower . snd) <$> lines'
-  where parseChunk [] = return []
-        parseChunk ls@((pos,_):_) = withInput (unlines (map snd ls)) $ withPosition pos $ (whiteSpace *> statements <* eof)
 
-        lines' = line `sepBy` char '\n'
-        line = do p <- getPosition
-                  l <- concat <$> many charToken
-                  return (p, l)
-        charToken = try lineComment <|> try blockComment <|> normalChar
-        normalChar = satisfy (/= '\n') >>= \c -> return [c]
+batches = do
+  b <- batch
+  more b <|> (return [Batch b Nothing])
+  where more b = do reps <- findBatchSeparator
+                    (Batch b reps:) <$> batches
+                  
 
-        -- Used to return blank here, but actually need to return the original comment (including embedded newlines) for the original error line numbers to be correct
-        lineComment = string "--" >> ("--" ++) <$> many (satisfy (/= '\n')) -- >> return ""
-        blockComment = startBlock >> (("/*" ++) . (++ "*/") <$> manyTill anyChar (try endBlock)) -- >> return ""
-        startBlock = string "/*"
-        endBlock = string "*/"
-        
--- Is this line a "GO"? Don't count leading and trailing whitespace
-isGo "" = False
-isGo (c:xs) | isSpace c = isGo xs
-isGo ('g':'o':xs) = all isSpace xs
-isGo _ = False
+-- The whiteSpace combination will refuse to read a line if finds a batchSeparator, so that
+-- we know we won't find a batchSeparator part-way through a line.
+-- Hence, here we can just attempt to read any empty lines (which there may or not be
+-- depending on if this follows a lexeme) and check for a batchSeparator.
+findBatchSeparator = lexeme $ try (emptyLines >> batchSeparator)
+  where emptyLines = skipMany (try (inlineWhiteSpace >> char '\n'))
                    
-run :: P a -> SourceName -> String -> Either ParseError a
-run p name str = runParser p () name str
+check :: P a -> String -> Either ParseError a
+check p str = runParser p initialParserState "input" str
 
-checkFile path = do
-  text <- readFile path
-  return $ run file path text
+checkFile path = runParser (whiteSpace *> batches <* whiteSpace <* eof) initialParserState path <$> readFile path
 
 checkAll path = do
-  names <- D.getDirectoryContents path
-  forM names $ \name -> do
+  names <- filter (".sql" `isSuffixOf`) . sort <$> getDirectoryContents path
+  passed <- forM names $ \name -> do
     sql <- checkFile (path </> name)
     case sql of
-     Left e -> return ()
-     Right r -> putStrLn name >> print r
+     Left e -> return Nothing -- fail (show e)
+     Right r -> do
+       writeFile (path </> (name ++ ".ast")) (show r)
+       return (Just name)
+  putStrLn "--------"
+  forM_ (zip [1..] (catMaybes passed)) $ \(i,name) -> do
+    putStrLn $ (show i) ++ ". " ++ name
+  putStrLn $ show (length (catMaybes passed)) ++ " out of " ++ show (length passed)
      
     

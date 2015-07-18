@@ -26,7 +26,9 @@ instance Show SrcLoc where
   showsPrec d (BadLoc str) = showString str
 
 instance Show SrcSpan where
-  showsPrec d (SrcSpan start end) = showsPrec d start . showString "-" . showsPrec d end
+  showsPrec d (SrcSpan start end)
+    | start == end = showsPrec d start
+    | otherwise = showsPrec d start . showString "-" . showsPrec d end
   showsPrec d (BadSpan str) = showString str
 
 mkLoc = SrcLoc

@@ -30,6 +30,7 @@ module Language.TransactSql.AST
        , Argument(..)
        , ArgumentType(..)
        , ProcedureOptions(..)
+       , Batch(..)
        ) where
 
 import Data.Generics
@@ -43,6 +44,7 @@ data Literal
     = IntL (Located Integer)
     | NumericL (Located Rational) Precision Scale
     | StrL (Located String)
+    | NStrL (Located String)
     | BinL (Located String) -- TODO BS.Word8?
     | NullL Keyword
     deriving (Eq, Ord, Show, Data, Typeable)
@@ -112,9 +114,10 @@ data Expr
   | EColRef { crSource :: Maybe ObjectName, crName :: Ident }
   | EUnary (Located UnaryOp) (Located Expr)
   | EBin (Located BinaryOp) (Located Expr) (Located Expr)
-  | ECall ObjectName (Located Ident)
-  | ECondCase [(Located Cond, Located Expr)] (Maybe (Located Expr))
-  | EExprCase (Located Expr) [(Located Expr, Located Expr)] (Maybe (Located Expr))
+  | EFunCall ObjectName [Located Expr]
+  | ECoalesce [Located Expr]
+  | ESearchCase [(Located Cond, Located Expr)] (Maybe (Located Expr))
+  | ESimpleCase (Located Expr) [(Located Expr, Located Expr)] (Maybe (Located Expr))
   | ECast (Located Expr) (Located SqlType)
   | EScalarSubquery (Located QuerySpec)
   deriving (Eq, Ord, Data, Typeable)
@@ -134,10 +137,12 @@ instance Show Expr where
     = showsPrec d op $ showsPrec d expr str
   showsPrec d (EBin (L _ op) (L _ left) (L _ right)) str
     = ('(':) . showsPrec d left . (" `" ++) . showsPrec d op . ("` " ++) . showsPrec d right . (')':) $ str
+  showsPrec d (EFunCall f xs) str = showsPrec d f . ("(" ++) . showList xs . (")" ++) $ str
+  showsPrec d (ECoalesce xs) str = ("coalesce(" ++) . showList xs . (")" ++) $ str
   showsPrec d (ECast (L _ expr) (L _ ty)) str
     = ("cast(" ++) . showsPrec d expr . (" as " ++) . showsPrec 0 ty . (')' :) $ str
-  showsPrec d (EExprCase (L _ e) cs else') str = ("case " ++) . showsPrec d e . (' ':) . (show cs ++) . (' ':) . showsPrec d else' $ str
-  showsPrec d (ECondCase cs else') str = ("case " ++) . showsPrec 0 cs . (' ':) . showsPrec d else' $ str
+  showsPrec d (ESimpleCase (L _ e) cs else') str = ("case " ++) . showsPrec d e . (' ':) . (show cs ++) . (' ':) . showsPrec d else' $ str
+  showsPrec d (ESearchCase cs else') str = ("case " ++) . showsPrec 0 cs . (' ':) . showsPrec d else' $ str
   showsPrec _ x str = gshow x ++ str
 
 data Subquery
@@ -167,7 +172,7 @@ data Pred
   | PIn Keyword (Located Expr) (Located Subquery)
   | PNotIn Keyword (Located Expr) (Located Subquery)
   | PCompareSubquery (Located Comparison) (Maybe (Located Qualifier)) (Located Expr) (Located Subquery)
-  | PExists Keyword (Located Subquery)
+  | PExists Keyword (Located QuerySpec)
   deriving (Eq, Ord, Show, Data, Typeable)
 
 data QueryTop
@@ -181,6 +186,7 @@ data SelectInto = SelectInto ObjectName (Maybe [Ident])
                 deriving (Eq, Ord, Show, Data, Typeable)
 
 data SelectColumn = SelectExpr (Located Expr) (Maybe Ident)
+                  | SelectIntoVar (Ident) (Located Expr)
                   | SelectWildcard (Maybe Ident)
                   deriving (Eq, Ord, Show, Data, Typeable)
 
@@ -243,7 +249,8 @@ data ProcedureOptions = ProcedureOptions
 data Statement
     = Declare Keyword [Located Decl]
     | Select (Located QuerySpec)
-    | If (Located Cond) (Located Statement) (Located Statement)
+    | SetVar Ident (Located Expr)
+    | If (Located Cond) (Located Statement) (Maybe (Located Statement))
     | While (Located Cond) (Located Statement)
     | Break
     | Continue
@@ -257,8 +264,12 @@ data Statement
     | DropProcedure (Located ObjectName)
     | CreateProcedure (Located ObjectName) [Argument] ProcedureOptions [Located Statement]
     | Block [Located Statement]
+    | ExecString (Located Expr) -- Can be concatted strings
+    | Exec (Maybe Ident) (Either ObjectName Ident) [Located Expr] [(Ident, Located Expr)]
     -- | Update | Delete | Fetch
     -- | DeclareCursor | Open | Deallocate | Close | Set
     -- | Drop | Create | Alter
     deriving (Eq, Ord, Show, Data, Typeable)
 
+data Batch = Batch [Located Statement] (Maybe (Located Integer))
+             deriving (Eq, Ord, Show, Data, Typeable)
