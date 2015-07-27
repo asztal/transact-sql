@@ -20,7 +20,7 @@ import Language.TransactSql.AST
 import Language.TransactSql.Loc
 
 import Control.Applicative ((<$>), (<|>), (<*), (<*>), (*>), (<$), many, pure)
-import Control.Monad (forM, forM_, liftM2, mzero, when)
+import Control.Monad (forM, forM_, liftM2, mzero, when, join)
 import Data.Char (toLower, toUpper, isSpace, digitToInt)
 import Data.Function (on)
 import Data.List (foldl', isSuffixOf, sort)
@@ -200,8 +200,8 @@ literal = (IntL <$> loc integer)
           <|> (NullL <$> keyword "null")
           <?> "value"
 
-typeName :: P SqlType
-typeName = (identifier >>= rest) <?> "type name"
+typeName :: Int -> P SqlType
+typeName defLen = (identifier >>= rest) <?> "type name"
   where rest "int" = pure Int
         rest "char" = Char <$> len
         rest "nchar" = NChar <$> len
@@ -213,19 +213,39 @@ typeName = (identifier >>= rest) <?> "type name"
         rest "real" = Float <$> pure 24
         rest "smalldatetime" = pure SmallDateTime
         rest "date" = pure Date
+        rest "money" = pure Money
+        rest "smallmoney" = pure SmallMoney
+        rest "bit" = pure Bit
+        rest "bigint" = pure BigInt
+        rest "smallint" = pure SmallInt
+        rest "tinyint" = pure TinyInt
+        rest "datetime" = pure DateTime 
+        rest "datetime2" = DateTime2 <$> spec 0 7 7
+        rest "time" = Time <$> spec 0 7 7
+        rest "datetimeoffset" = DateTimeOffset <$> spec 0 7 7
+        rest "text" = pure Text
+        rest "ntext" = pure NText
+        rest "image" = pure Image
         rest name = fail $ "unknown type name: " ++ name
 
         spec minVal maxVal defVal = option defVal (parens $ boundedInt 0 maxVal)
         len = parens (reserved "max" *> pure (-1)
                       <|> boundedInt 1 0x7FFFFFFF)
-              
+              <|> pure defLen
+
+castTypeName, declTypeName :: P SqlType
+castTypeName = typeName 30
+declTypeName = typeName 1
+
 term :: P Expr
 term = unLoc <$> parens expr
        <|> varName 
        <|> ELit <$> loc literal
-       <|> reserved "cast" *> parens (ECast <$> expr <*> (reserved "as" *> loc typeName))
+       -- TODO: br.dateProcessed
+       <|> try (EColRef . Just <$> (ident <* period) <*> ident)
+       <|> reserved "cast" *> parens (ECast <$> expr <*> (reserved "as" *> loc castTypeName))
+       <|> convert
        <|> caseExpr
-       <|> try (EColRef . Just <$> (objectName <* period) <*> ident)
        <|> try funCall
        <|> EColRef Nothing <$> ident
   where caseExpr = reserved "case" *> (condCase <|> exprCase) <* reserved "end"
@@ -236,6 +256,10 @@ term = unLoc <$> parens expr
         varName = try (EServerVar <$> Ident <$> loc serverVar)
                   <|> EVar <$> Ident <$> loc var
                   <?> "variable name"
+        convert = reserved "convert" *>
+                  parens (EConvert <$> loc castTypeName
+                                   <*> (comma *> expr)
+                                   <*> optionMaybe (comma >> loc integer))
         funCall = EFunCall <$> try (specialFun <|> objectName) <*> parens (expr `sepBy` comma)
         specialFun = choice $ map (\w -> ObjectName Nothing Nothing Nothing <$> loc (reserved w)) ["left", "right"]
 
@@ -267,10 +291,21 @@ expr = loc (unLoc <$> buildExpressionParser ops (loc term)) <?> "expression"
           = Prefix $ do L lu op <- loc (reservedOp name)
                         return (\xx@(L l x) -> L (combineSpan lu l) (EUnary (L lu unOp) xx))
 
+locChainl1 :: P a -> P (Located a -> Located a -> a) -> P a
+locChainl1 p op = join (rest <$> getPosition <*> loc p)
+  where rest startPos left = chained startPos left <|> pure (unLoc left)
+        chained startPos left = do
+          f <- op
+          right <- loc p
+          pos <- getPosition
+          rest startPos $ L (mkSpan startPos pos) (f left right)
+                  
 cond :: P Cond
-cond = CPred <$> predicate
-       <|> CNot <$> keyword "not" <*> loc cond
-       <?> "condition"
+cond = orCond <?> "condition"
+  where basicCond = CNot <$> keyword "not" <*> loc cond
+                    <|> CPred <$> predicate
+        andCond = locChainl1 basicCond (CAnd <$> keyword "and")
+        orCond = locChainl1 andCond (COr <$> keyword "or")
 
 comparison :: P Comparison
 comparison = reservedOp "=" *> pure CEq
@@ -313,8 +348,43 @@ objectName = try (ObjectName <$> part
   where part = Just <$> loc rawIdent
         opt = optionMaybe (loc rawIdent)
 
-tableRef :: P TableRef
-tableRef = uncurry TableRef <$> withAlias objectName
+basicTableRef, tableRef :: P TableRef
+tableRef = join $ rest <$> getPosition <*> loc basicTableRef
+  where rest startPos left =
+          joinWithCond startPos left
+          <|> joinNoCond startPos left
+          <|> pure (unLoc left)
+
+        -- inner join, left join, right join, full outer join...
+        joinWithCond startPos left = do
+          f <- opWithCond
+          right <- loc basicTableRef
+          cond <- loc joinCondition
+          pos <- getPosition
+          let left' = L (mkSpan startPos pos) (f left right (Just cond))
+          rest startPos left'
+
+        -- cross join, cross apply, etc?
+        joinNoCond startPos left = do
+          f <- opNoCond
+          right <- loc basicTableRef
+          pos <- getPosition
+          let left' = L (mkSpan startPos pos) (f left right Nothing)
+          rest startPos left'
+
+        joinCondition = reserved "on" *> cond
+
+        opWithCond, opNoCond :: P (Located TableRef -> Located TableRef -> Maybe (Located Cond) -> TableRef)
+        opWithCond = Join <$> loc (Inner <$ (optional (reserved "inner") *> reserved "join"))
+                     <|> Join <$> loc (RightOuter <$ (reserved "right" *> reserved "join"))
+                     <|> Join <$> loc (LeftOuter <$ (reserved "left" *> optional (reserved "outer") *> reserved "join"))
+                     <|> Join <$> loc (FullOuter <$ (reserved "full" *> optional (reserved "outer") *> reserved "join"))
+                     <?> "join operator"
+                     
+        opNoCond = Join <$> loc (Cross <$ (reserved "cross" *> reserved "join"))
+                   <?> "join operator"
+
+basicTableRef = uncurry TableRef <$> withAlias objectName <?> "table name or subquery"
 
 -- Parses "x as y" or "x y"
 withAlias :: P a -> P (a, Maybe Ident)
@@ -360,7 +430,7 @@ declare = Declare <$> keyword "declare" <*> (loc eqn `sepBy1` comma)
   where eqn :: P Decl
         eqn = Decl
               <$> (Ident <$> loc var)
-              <*> (optional (reserved "as") *> loc typeName)
+              <*> (optional (reserved "as") *> loc declTypeName)
               <*> optionMaybe (equals *> expr)
               <?> "declaration"
 
@@ -387,7 +457,7 @@ createStatement = keyword "create" *> (keyword "procedure" *> createProc)
         args = arg `sepBy` comma
         arg = Argument
               <$> (Ident <$> loc var)
-              <*> (optional (reserved "as") *> loc typeName)
+              <*> (optional (reserved "as") *> loc declTypeName)
               <*> loc argType
               <*> optionMaybe (equals *> expr)
 
@@ -409,7 +479,18 @@ flowStatement = block <|> if' <|> while <|> break <|> continue <|> goto <|> retu
 dmlStatement :: P Statement
 dmlStatement = declare
             <|> (Select <$> loc select)
+            <|> reserved "insert" *> (optional $ reserved "into") *> insert
             <|> reserved "set" *> (SetVar <$> (Ident <$> loc var) <*> (equals *> expr))
+  where insert = Insert <$> objectName
+                        <*> option [] (parens $ ident `sepBy1` comma)
+                        <*> insertFrom
+
+        insertFrom = Nothing <$ keywords ["default", "values"]
+                     <|> Just . Subquery <$> loc select
+                     <|> Just . ValueList <$> values
+
+values = reserved "values" *> (parens row `sepBy1` comma)
+  where row = expr `sepBy1` comma
 
 ddlStatement :: P Statement
 ddlStatement = dropStatement <|> createStatement
@@ -433,8 +514,25 @@ execStatement = do (keyword "exec" <|> keyword "execute") *> (execString <|> exe
 
         namedArg = (,) <$> (Ident <$> (loc var <* equals)) <*> loc posArg
 
+backupStatement :: P Statement
+backupStatement = Backup <$> (reserved "backup" *> loc backupType)
+                         <*> what
+                         <*> (reserved "to" *> target)
+  where backupType = DatabaseBackup <$ reserved "database"
+                     <|> LogBackup <$ reserved "log"
+        what = BackupStatic <$> ident
+               <|> BackupDynamic <$> (Ident <$> loc var)
+        target = BackupToDisk <$> (reserved "disk" *> equals *> loc stringLit)
+                 <|> BackupToDevice <$> ident
+        
+
 statement :: P Statement
-statement = execStatement <|> flowStatement <|> ddlStatement <|> dmlStatement <?> "statement"
+statement = execStatement
+            <|> flowStatement
+            <|> ddlStatement
+            <|> dmlStatement
+            <|> backupStatement
+            <?> "statement"
 
 statements :: P [Located Statement]
 statements = loc statement `sepBy` optional semicolon
@@ -482,7 +580,9 @@ checkAll path = do
   passed <- forM names $ \name -> do
     sql <- checkFile (path </> name)
     case sql of
-     Left e -> return Nothing -- fail (show e)
+     Left e -> do
+       putStrLn $ take 120 (concat (lines (show e)))
+       return Nothing -- fail (show e)
      Right r -> do
        writeFile (path </> (name ++ ".ast")) (show r)
        return (Just name)

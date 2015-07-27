@@ -31,6 +31,11 @@ module Language.TransactSql.AST
        , ArgumentType(..)
        , ProcedureOptions(..)
        , Batch(..)
+       , CursorOptions(..)
+       , BackupType(..)
+       , BackupSource(..)
+       , BackupDestination(..)
+       , FetchType(..)
        ) where
 
 import Data.Generics
@@ -111,7 +116,7 @@ data Expr
   = EVar Ident
   | EServerVar Ident
   | ELit (Located Literal)
-  | EColRef { crSource :: Maybe ObjectName, crName :: Ident }
+  | EColRef { crSource :: Maybe Ident, crName :: Ident }
   | EUnary (Located UnaryOp) (Located Expr)
   | EBin (Located BinaryOp) (Located Expr) (Located Expr)
   | EFunCall ObjectName [Located Expr]
@@ -119,6 +124,7 @@ data Expr
   | ESearchCase [(Located Cond, Located Expr)] (Maybe (Located Expr))
   | ESimpleCase (Located Expr) [(Located Expr, Located Expr)] (Maybe (Located Expr))
   | ECast (Located Expr) (Located SqlType)
+  | EConvert (Located SqlType) (Located Expr) (Maybe (Located Integer))
   | EScalarSubquery (Located QuerySpec)
   deriving (Eq, Ord, Data, Typeable)
 
@@ -129,8 +135,8 @@ instance Show Expr where
     = '@' : '@' : (s ++ str)
   showsPrec d (ELit (L _ x)) str
     = showsPrec d x str
-  showsPrec d (EColRef (Just src) (Ident (L _ name))) str
-    = ('[' :) . showsPrec d src . ("].[" ++) . (name ++) . (']' :) $ str
+  showsPrec d (EColRef (Just (Ident (L _ src))) (Ident (L _ name))) str
+    = ('[' :) . (src ++) . ("].[" ++) . (name ++) . (']' :) $ str
   showsPrec d (EColRef Nothing (Ident (L _ name))) str
     = ('[' :) . (name ++) . (']' :) $ str
   showsPrec d (EUnary (L _ op) (L _ expr)) str
@@ -141,13 +147,15 @@ instance Show Expr where
   showsPrec d (ECoalesce xs) str = ("coalesce(" ++) . showList xs . (")" ++) $ str
   showsPrec d (ECast (L _ expr) (L _ ty)) str
     = ("cast(" ++) . showsPrec d expr . (" as " ++) . showsPrec 0 ty . (')' :) $ str
+  showsPrec d (EConvert (L _ ty) (L _ expr) x) str
+    = ("convert(" ++) . showsPrec d ty . (", " ++) . showsPrec 0 expr . (", " ++) . showsPrec 0 x . (')' :) $ str
   showsPrec d (ESimpleCase (L _ e) cs else') str = ("case " ++) . showsPrec d e . (' ':) . (show cs ++) . (' ':) . showsPrec d else' $ str
   showsPrec d (ESearchCase cs else') str = ("case " ++) . showsPrec 0 cs . (' ':) . showsPrec d else' $ str
   showsPrec _ x str = gshow x ++ str
 
 data Subquery
   = Subquery (Located QuerySpec)
-  | ValueList [Located Expr]
+  | ValueList [[Located Expr]]
   deriving (Eq, Ord, Show, Data, Typeable)
 
 data Qualifier = All | Some | Any
@@ -209,7 +217,7 @@ data QueryExpression
     | QSetOp (Located SetOp) (Located QueryExpression) (Located QueryExpression)
     deriving (Eq, Ord, Show)
 
-data JoinType = Inner | LeftOuter | RightOuter | FullOuter
+data JoinType = Inner | LeftOuter | RightOuter | FullOuter | Cross
               deriving (Eq, Ord, Show, Read, Enum, Bounded, Data, Typeable)
 
 data TableRef
@@ -220,8 +228,10 @@ data TableRef
       { tjType :: Located JoinType
       , tjLeft :: Located TableRef
       , tjRight :: Located TableRef
-      , tjCond :: Maybe (Located Expr) }
-    -- | Values 
+      , tjCond :: Maybe (Located Cond) }
+    | Values
+    -- | CrossApply
+    -- | OuterApply
     deriving (Eq, Ord, Show, Data, Typeable)
 
 data Condition
@@ -249,6 +259,7 @@ data ProcedureOptions = ProcedureOptions
 data Statement
     = Declare Keyword [Located Decl]
     | Select (Located QuerySpec)
+    | Insert ObjectName [Ident] (Maybe Subquery) -- Nothing = "default values"
     | SetVar Ident (Located Expr)
     | If (Located Cond) (Located Statement) (Maybe (Located Statement))
     | While (Located Cond) (Located Statement)
@@ -266,10 +277,31 @@ data Statement
     | Block [Located Statement]
     | ExecString (Located Expr) -- Can be concatted strings
     | Exec (Maybe Ident) (Either ObjectName Ident) [Located Expr] [(Ident, Located Expr)]
-    -- | Update | Delete | Fetch
-    -- | DeclareCursor | Open | Deallocate | Close | Set
+    | Backup (Located BackupType) BackupSource BackupDestination -- TODO: other stuff...
+    | DeclareCursor Ident CursorOptions (Located QuerySpec)
+    | Open Ident
+    | Close Ident
+    | Deallocate Ident
+    | Fetch (Located FetchType) Ident [Ident]
+    -- | Update | Delete
     -- | Drop | Create | Alter
     deriving (Eq, Ord, Show, Data, Typeable)
+
+data CursorOptions = CursorOptions
+                   deriving (Eq, Ord, Show, Data, Typeable)
+data FetchType = FetchCurrent | FetchNext | FetchPrior | FetchFirst | FetchLast
+                deriving (Eq, Ord, Show, Data, Typeable, Enum, Bounded)
+
+data BackupType = DatabaseBackup | LogBackup
+                deriving (Eq, Ord, Show, Data, Typeable, Enum, Bounded)
+
+data BackupSource = BackupStatic Ident -- backup database [DATABASE_NAME]
+                  | BackupDynamic Ident -- backup database @database_name_var
+                  deriving (Eq, Ord, Show, Data, Typeable)
+
+data BackupDestination = BackupToDisk (Located FilePath)
+                       | BackupToDevice Ident
+                deriving (Eq, Ord, Show, Data, Typeable)
 
 data Batch = Batch [Located Statement] (Maybe (Located Integer))
              deriving (Eq, Ord, Show, Data, Typeable)
