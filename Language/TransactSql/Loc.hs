@@ -53,3 +53,6 @@ data GenLocated l a
 instance Show a => Show (GenLocated l a) where
   showsPrec d (L _ x) = showsPrec d x
   show (L _ x) = show x
+
+instance Functor (GenLocated l) where
+  fmap f (L l x) = L l (f x)

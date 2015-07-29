@@ -11,6 +11,7 @@ module Language.TransactSql.AST
        , Comparison(..)
        , SubqueryOp(..)
        , SubqueryQualifier(..)
+       , AggregateMode(..)
        , Expr(..)
        , Subquery(..)
        , Qualifier(..)
@@ -20,6 +21,7 @@ module Language.TransactSql.AST
        , SelectInto(..)
        , SelectColumn(..)
        , QuerySpec(..)
+       , Order(..)
        , SetOp(..)
        , QueryExpression(..)
        , JoinType(..)
@@ -112,6 +114,9 @@ data SubqueryQualifier
   | SAll
   deriving (Eq, Ord, Show, Read, Data, Typeable)
 
+data AggregateMode = AggregateAll | AggregateDistinct
+  deriving (Eq, Ord, Show, Read, Enum, Bounded, Data, Typeable)
+
 data Expr
   = EVar Ident
   | EServerVar Ident
@@ -119,6 +124,13 @@ data Expr
   | EColRef { crSource :: Maybe Ident, crName :: Ident }
   | EUnary (Located UnaryOp) (Located Expr)
   | EBin (Located BinaryOp) (Located Expr) (Located Expr)
+  | EWindowed 
+    { wfFun :: Ident
+    , wfMode :: Located AggregateMode
+    , wfExpr ::  Maybe (Located Expr)
+    , wfPartition :: [Located Expr]
+    , wfOrder :: [(Located Expr, Located Order)] }
+    -- TODO rows 
   | EFunCall ObjectName [Located Expr]
   | ECoalesce [Located Expr]
   | ESearchCase [(Located Cond, Located Expr)] (Maybe (Located Expr))
@@ -143,6 +155,7 @@ instance Show Expr where
     = showsPrec d op $ showsPrec d expr str
   showsPrec d (EBin (L _ op) (L _ left) (L _ right)) str
     = ('(':) . showsPrec d left . (" `" ++) . showsPrec d op . ("` " ++) . showsPrec d right . (')':) $ str
+  showsPrec d (EWindowed (Ident (L _ f)) m x ps os) str = (f ++) . ("(" ++) . showsPrec d m . (" " ++) . showsPrec d x . (") over (partition by " ++) . showList ps . (" order by " ++) . showList os . (")" ++) $ str
   showsPrec d (EFunCall f xs) str = showsPrec d f . ("(" ++) . showList xs . (")" ++) $ str
   showsPrec d (ECoalesce xs) str = ("coalesce(" ++) . showList xs . (")" ++) $ str
   showsPrec d (ECast (L _ expr) (L _ ty)) str
@@ -198,6 +211,9 @@ data SelectColumn = SelectExpr (Located Expr) (Maybe Ident)
                   | SelectWildcard (Maybe Ident)
                   deriving (Eq, Ord, Show, Data, Typeable)
 
+data Order = Asc | Desc
+           deriving (Eq, Ord, Show, Enum, Bounded, Data, Typeable)
+
 data QuerySpec
     = QuerySpec
       { qsTop :: Maybe (Located QueryTop)
@@ -206,7 +222,8 @@ data QuerySpec
       , qsFrom :: Maybe (Located TableRef)
       , qsWhere :: Maybe (Located Cond)
       , qsGroupBy :: [Located Expr]
-      , qsHaving :: Maybe (Located Cond) }
+      , qsHaving :: Maybe (Located Cond)
+      , qsOrderBy :: [(Located Expr, Located Order)] }
     deriving (Eq, Ord, Show, Data, Typeable)
 
 data SetOp = Union | UnionAll | Except | Intersect
@@ -229,7 +246,9 @@ data TableRef
       , tjLeft :: Located TableRef
       , tjRight :: Located TableRef
       , tjCond :: Maybe (Located Cond) }
-    | Values
+    | QueryRef
+      { qrQuery :: Subquery
+      , qrAlias :: Maybe (Ident, [Ident]) }
     -- | CrossApply
     -- | OuterApply
     deriving (Eq, Ord, Show, Data, Typeable)
@@ -265,7 +284,7 @@ data Statement
     | While (Located Cond) (Located Statement)
     | Break
     | Continue
-    | Return (Located Expr)
+    | Return (Maybe (Located Expr))
     | Goto Ident
     | Throw
     | ThrowSpecific { throwErrorNo :: Either (Located Int) Ident

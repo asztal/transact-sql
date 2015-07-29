@@ -26,6 +26,7 @@ import Data.Function (on)
 import Data.List (foldl', isSuffixOf, sort)
 import Data.Maybe (fromMaybe, catMaybes)
 import Data.List.Split (splitWhen)
+import Data.Ratio ((%))
 import System.Directory (getDirectoryContents)
 import System.FilePath ((</>))
 
@@ -74,6 +75,10 @@ reservedWords = ["add", "all", "alter", "and", "any", "as", "asc", "authorizatio
                  "tablesample", "textsize", "then", "to", "top", "tran", "transaction", "trigger", "truncate",
                  "try_convert", "tsequal", "union", "unique", "unpivot", "update", "updatetext", "use", "user",
                  "values", "varying", "view", "waitfor", "when", "where", "while", "with", "within group", "writetext"]
+
+aggregates = ["avg", "checksum_agg", "count", "count_big", "grouping", "grouping_id", "max", "min", "stdev", "stdevp", "var", "varp"]
+ranking = ["dense_rank", "ntile", "rank", "row_number"]
+analytic = ["cume_dist", "first_value", "lag", "last_value", "lead", "percentile_cont", "percentile_disc", "percent_rank"]
 
 operatorChars = "-=+*&^%/<>~|."
 
@@ -131,12 +136,15 @@ lineSpace = satisfy (\c -> isSpace c && c /= '\n') *> return ()
 
 nat, natural :: P Integer
 natural = lexeme nat
-nat = foldl' (\x d -> 10*x + toInteger (digitToInt d)) 0 <$> many1 digit 
+nat = foldl' (\x d -> 10*x + toInteger (digitToInt d)) 0 <$> many1 digit
+readBase10 str = foldl' (\x d -> 10*x + toInteger (digitToInt d)) 0 str
 
 integer = lexeme sign <*> natural
-  where sign = char '-' *> pure negate
-               <|> char '+' *> pure id
-               <|> pure id
+
+sign :: Num a => P (a -> a) 
+sign = char '-' *> pure negate
+       <|> char '+' *> pure id
+       <|> pure id
 
 lexeme p = p <* whiteSpace
 
@@ -168,14 +176,16 @@ boundedInt low high = do
     fail ("expected number between " ++ show low ++ " and " ++ show high)
   return (fromIntegral n)
 
-var = lexeme (char '@' *> identifier)
-serverVar = lexeme (char '@' *> char '@' *> identifier)
+var = lexeme (char '@' *> many1 alphaNum)
+serverVar = lexeme (char '@' *> char '@' *> many1 alphaNum)
 
 comma = symbol ","
 period = symbol "."
 star = symbol "*"
 equals = symbol "="
 semicolon = symbol ";"
+leftParen = symbol "("
+rightParen = symbol ")"
 
 loc :: P a -> P (Located a)
 loc p = do
@@ -194,11 +204,19 @@ keywords words = Keyword <$> loc (mapM_ reserved words >> pure (unwords words))
 stringLit = lexeme $ (quoted '\'' '\'')
 
 literal :: P Literal
-literal = (IntL <$> loc integer)
+literal = try (lexeme numeric)
+          <|> (IntL <$> loc integer)
           <|> (StrL <$> loc stringLit)
           <|> try (char 'N' *> (NStrL <$> loc stringLit))
           <|> (NullL <$> keyword "null")
           <?> "value"
+  where numeric = parse <$> sign <*> loc (many1 digit) <*> optionMaybe (loc (char '.' *> many digit)) -- at least one digit before .
+                  <|> parse <$> sign <*> loc (pure "") <*> (Just <$> loc (char '.' *> many1 digit))   -- at least one digit after .
+        parse f (L l x) Nothing = IntL $ L l (f $ readBase10 x)
+        parse f (L l x) (Just (L l' y)) = let prec = length $ dropWhile (== '0') x -- ignore leading zeros in integral part
+                                              scale = length y
+                                              value = f (read (x ++ y)) % (10 ^ scale)
+                                          in NumericL (L (l `combineSpan` l') value) (prec + scale) scale
 
 typeName :: Int -> P SqlType
 typeName defLen = (identifier >>= rest) <?> "type name"
@@ -242,11 +260,12 @@ term = unLoc <$> parens expr
        <|> varName 
        <|> ELit <$> loc literal
        -- TODO: br.dateProcessed
-       <|> try (EColRef . Just <$> (ident <* period) <*> ident)
        <|> reserved "cast" *> parens (ECast <$> expr <*> (reserved "as" *> loc castTypeName))
        <|> convert
        <|> caseExpr
+       <|> try aggregate
        <|> try funCall
+       <|> try (EColRef . Just <$> (ident <* period) <*> ident)
        <|> EColRef Nothing <$> ident
   where caseExpr = reserved "case" *> (condCase <|> exprCase) <* reserved "end"
         condCase = ESearchCase <$> many1 (branch (loc cond)) <*> final
@@ -260,8 +279,37 @@ term = unLoc <$> parens expr
                   parens (EConvert <$> loc castTypeName
                                    <*> (comma *> expr)
                                    <*> optionMaybe (comma >> loc integer))
+
+        aggregate = do
+          (ordered, isRanking, name) <- try (aggregateName =<< loc identifier) <* leftParen
+          mode <- loc aggregateMode
+          expr <- if isRanking then return Nothing
+                               else (Nothing <$ star <|> fmap Just expr)
+          _ <- rightParen
+          (part, order) <- option ([],[]) (overClause ordered)
+          return $ EWindowed name mode expr part order
+
+        aggregateName n@(L l name)
+          | map toLower name `elem` aggregates = return (False, False, Ident n)
+          | map toLower name `elem` ranking = return (True, True, Ident n)
+          | map toLower name `elem` analytic = return (True, False, Ident n)
+          | otherwise = fail "not an aggregate function"
+
+        overClause :: Bool -> P ([Located Expr], [(Located Expr, Located Order)])
+        overClause ordered = do
+          reserved "over" *> leftParen
+          part <- option [] (keywords ["partition", "by"] *> (expr `sepBy1` comma))
+          let orderCombinator = if ordered then id else option []
+          order <- orderCombinator $ keywords ["order", "by"] *> (columnOrdering `sepBy1` comma)
+          _ <- rightParen
+          return (part, order)
+          
+        aggregateMode = AggregateAll <$ reserved "all" 
+                        <|> AggregateDistinct <$ reserved "distinct"
+                        <|> pure AggregateAll
+                        
         funCall = EFunCall <$> try (specialFun <|> objectName) <*> parens (expr `sepBy` comma)
-        specialFun = choice $ map (\w -> ObjectName Nothing Nothing Nothing <$> loc (reserved w)) ["left", "right"]
+        specialFun = choice $ map (\w -> ObjectName Nothing Nothing Nothing <$> loc (reserved w)) ["coalesce", "left", "right", "nullif"]
 
 expr :: P (Located Expr)
 expr = loc (unLoc <$> buildExpressionParser ops (loc term)) <?> "expression"
@@ -302,7 +350,8 @@ locChainl1 p op = join (rest <$> getPosition <*> loc p)
                   
 cond :: P Cond
 cond = orCond <?> "condition"
-  where basicCond = CNot <$> keyword "not" <*> loc cond
+  where basicCond = parens cond
+                    <|> CNot <$> keyword "not" <*> loc cond
                     <|> CPred <$> predicate
         andCond = locChainl1 basicCond (CAnd <$> keyword "and")
         orCond = locChainl1 andCond (COr <$> keyword "or")
@@ -321,13 +370,13 @@ predicate = PExists <$> keyword "exists" <*> parens (loc select)
             <|> (expr >>= expressionPred)
   where expressionPred e =
           PCompare <$> (loc comparison) <*> pure e <*> expr
-          <|> PNull <$> keywords ["is", "null"] <*> pure e
+          <|> PNull <$> try (keywords ["is", "null"]) <*> pure e
           <|> PNotNull <$> keywords ["is", "not", "null"] <*> pure e
           <|> PBetween <$> keyword "between" <*> pure e <*> expr <*> expr
 
 -- xyz, [xyz], or "xyz"
 rawIdent :: P String
-rawIdent = quoted '[' ']' <|> quoted '"' '"' <|> identifier
+rawIdent = lexeme (quoted '[' ']') <|> lexeme (quoted '"' '"') <|> identifier
 
 ident :: P Ident
 ident = Ident <$> loc rawIdent
@@ -384,7 +433,12 @@ tableRef = join $ rest <$> getPosition <*> loc basicTableRef
         opNoCond = Join <$> loc (Cross <$ (reserved "cross" *> reserved "join"))
                    <?> "join operator"
 
-basicTableRef = uncurry TableRef <$> withAlias objectName <?> "table name or subquery"
+basicTableRef = namedTable <|> subquery <?> "table name or subquery"
+  where namedTable = uncurry TableRef <$> withAlias objectName
+        subquery = QueryRef <$> parens (Subquery <$> loc select) <*> optionMaybe columnNames
+        columnNames = (,) <$> (reserved "as" *> ident)
+                          <*> option [] (parens (ident `sepBy1` comma))
+
 
 -- Parses "x as y" or "x y"
 withAlias :: P a -> P (a, Maybe Ident)
@@ -400,13 +454,15 @@ select = do
   where' <- optionMaybe (reserved "where" *> loc cond)
   groupBy <- option [] $ keywords ["group", "by"] *> (expr `sepBy` comma)
   having <- optionMaybe (reserved "having" *> loc cond)
+  orderBy <- option [] $ keywords ["order", "by"] *> (columnOrdering `sepBy` comma) 
   return $ QuerySpec { qsTop = top
                      , qsColumns = cols
                      , qsInto = into
                      , qsFrom = from
                      , qsWhere = where'
                      , qsGroupBy = groupBy
-                     , qsHaving = having }
+                     , qsHaving = having
+                     , qsOrderBy = orderBy }
 
   where
     col = try (SelectWildcard <$> optionMaybe (ident <* period) <* star)
@@ -420,10 +476,16 @@ select = do
               <*> optionMaybe (keyword "percent")
               <*> optionMaybe (keywords ["with", "ties"])
 
+
     selectInto :: P SelectInto
     selectInto = SelectInto
                  <$> objectName
                  <*> optionMaybe (parens $ many1 ident)
+
+columnOrdering = (,) <$> expr <*> loc sort 
+  where sort = Asc <$ reserved "asc"
+               <|> Desc <$ reserved "desc"
+               <|> pure Asc
 
 declare :: P Statement
 declare = Declare <$> keyword "declare" <*> (loc eqn `sepBy1` comma)
@@ -473,7 +535,7 @@ flowStatement = block <|> if' <|> while <|> break <|> continue <|> goto <|> retu
         while = reserved "while" *> (While <$> loc cond <*> loc statement)
         break = reserved "break" *> pure Break
         continue = reserved "continue" *> pure Continue
-        return = reserved "return" *> (Return <$> expr)
+        return = reserved "return" *> (Return <$> optionMaybe expr)
         goto = reserved "goto" *> (Goto <$> (Ident <$> loc identifier))
 
 dmlStatement :: P Statement
